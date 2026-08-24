@@ -6,7 +6,6 @@ export const maxDuration = 300;
 
 type WhisperWord = { word: string; start: number; end: number };
 type NcConfig = { baseUrl: string; username: string; appPassword: string; folderPath: string };
-
 type FolderItem = { name: string; isCollection: boolean; size: number; modified: string };
 
 function getConfig(): NcConfig {
@@ -34,8 +33,8 @@ function decodeHrefName(href: string) {
   catch { return href.replace(/\/$/, "").split("/").pop() || ""; }
 }
 
-async function listFolder(c: NcConfig): Promise<FolderItem[]> {
-  const r = await fetch(davUrl(c), {
+async function listFolder(c: NcConfig, relativeFolder = ""): Promise<FolderItem[]> {
+  const r = await fetch(davUrl(c, relativeFolder), {
     method: "PROPFIND",
     headers: { Authorization: authHeader(c), Depth: "1", "Content-Type": "application/xml; charset=utf-8" },
     body: `<?xml version="1.0" encoding="utf-8" ?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/></d:prop></d:propfind>`,
@@ -44,7 +43,7 @@ async function listFolder(c: NcConfig): Promise<FolderItem[]> {
   if (!r.ok && r.status !== 207) throw new Error(`Nextcloud-Zugriff fehlgeschlagen (${r.status} ${r.statusText}).`);
   const xml = await r.text();
   const responses = xml.match(/<(?:d:)?response\b[\s\S]*?<\/(?:d:)?response>/gi) || [];
-  const folderName = decodeURIComponent(c.folderPath.split("/").filter(Boolean).pop() || "");
+  const folderName = decodeURIComponent((relativeFolder || c.folderPath).split("/").filter(Boolean).pop() || "");
   return responses.map((block) => {
     const href = block.match(/<(?:d:)?href>([\s\S]*?)<\/(?:d:)?href>/i)?.[1] || "";
     const isCollection = /<(?:d:)?collection\s*\/?\s*>/i.test(block);
@@ -54,20 +53,30 @@ async function listFolder(c: NcConfig): Promise<FolderItem[]> {
   }).filter(x => x.name && x.name !== folderName);
 }
 
-async function download(c: NcConfig, name: string) {
-  const r = await fetch(davUrl(c, name), { headers: { Authorization: authHeader(c) }, cache: "no-store" });
-  if (!r.ok) throw new Error(`Datei ${name} konnte nicht aus Nextcloud geladen werden (${r.status}).`);
+async function download(c: NcConfig, relativePath: string) {
+  const r = await fetch(davUrl(c, relativePath), { headers: { Authorization: authHeader(c) }, cache: "no-store" });
+  if (!r.ok) throw new Error(`Datei ${relativePath} konnte nicht aus Nextcloud geladen werden (${r.status}).`);
   return Buffer.from(await r.arrayBuffer());
 }
 
-async function uploadText(c: NcConfig, name: string, text: string) {
-  const r = await fetch(davUrl(c, name), {
+async function uploadText(c: NcConfig, relativePath: string, text: string) {
+  const r = await fetch(davUrl(c, relativePath), {
     method: "PUT",
     headers: { Authorization: authHeader(c), "Content-Type": "text/plain; charset=utf-8" },
     body: text,
   });
   if (!r.ok && r.status !== 201 && r.status !== 204) {
-    throw new Error(`Ergebnis ${name} konnte nicht in Nextcloud gespeichert werden (${r.status}).`);
+    throw new Error(`Ergebnis ${relativePath} konnte nicht in Nextcloud gespeichert werden (${r.status}).`);
+  }
+}
+
+async function moveFile(c: NcConfig, from: string, to: string) {
+  const r = await fetch(davUrl(c, from), {
+    method: "MOVE",
+    headers: { Authorization: authHeader(c), Destination: davUrl(c, to), Overwrite: "T" },
+  });
+  if (!r.ok && r.status !== 201 && r.status !== 204) {
+    throw new Error(`Datei ${from} konnte nicht nach ${to} verschoben werden (${r.status}).`);
   }
 }
 
@@ -125,7 +134,9 @@ async function transcribe(openai:OpenAI, audioName:string, audio:Buffer) {
   }
   const words:WhisperWord[]=[]; const texts:string[]=[];
   for(let i=0;i<parts.length;i++){
-    const p=parts[i]; const file=new File([p.buffer], parts.length===1?audioName:`chunk-${i+1}.wav`, {type:mimeFor(audioName)});
+    const p=parts[i];
+    const bytes = new Uint8Array(p.buffer.buffer, p.buffer.byteOffset, p.buffer.byteLength);
+    const file=new File([bytes], parts.length===1?audioName:`chunk-${i+1}.wav`, {type:mimeFor(audioName)});
     const tr:any=await openai.audio.transcriptions.create({file,model:"whisper-1",response_format:"verbose_json",timestamp_granularities:["word","segment"],language:"de",prompt:"Dies ist ein deutschsprachiger experimenteller Gesang. Bitte auch gedehnte, ungewöhnlich artikulierte Wörter möglichst wörtlich erfassen."} as any);
     texts.push(String(tr.text||""));
     for(const w of tr.words||[]){ const start=Number(w.start),end=Number(w.end); if(String(w.word||"")&&Number.isFinite(start)&&Number.isFinite(end))words.push({word:String(w.word),start:start+p.offsetSeconds,end:end+p.offsetSeconds}); }
@@ -134,15 +145,17 @@ async function transcribe(openai:OpenAI, audioName:string, audio:Buffer) {
 }
 
 async function processFiles(audioName?:string, lyricsName?:string) {
-  const c=getConfig(); const files=(await listFolder(c)).filter(x=>!x.isCollection);
+  const c=getConfig();
+  const files=(await listFolder(c,"in")).filter(x=>!x.isCollection);
   const audioExt=/\.(wav|mp3|m4a|flac|ogg|webm)$/i; const textExt=/\.(txt|lyrics)$/i;
   const audioItem=audioName?files.find(x=>x.name===audioName):files.filter(x=>audioExt.test(x.name)).sort((a,b)=>Date.parse(b.modified||"")-Date.parse(a.modified||""))[0];
-  if(!audioItem)throw new Error("Im Nextcloud-Ordner wurde keine Audiodatei gefunden.");
+  if(!audioItem)throw new Error("Im Nextcloud-Ordner /LRC-Agent/in wurde keine Audiodatei gefunden.");
   const base=audioItem.name.replace(/\.[^.]+$/,""), cleanBase=base.replace(/^Stlle\b/i,"Stille");
-  let lyricsItem=lyricsName?files.find(x=>x.name===lyricsName):files.find(x=>x.name.toLowerCase()===`${base.toLowerCase()}.txt`)||files.find(x=>x.name.toLowerCase()===`${cleanBase.toLowerCase()}.txt`)||files.filter(x=>textExt.test(x.name)).sort((a,b)=>Date.parse(b.modified||"")-Date.parse(a.modified||""))[0];
-  if(!lyricsItem)throw new Error("Keine Lyrics-Datei gefunden. Lege eine .txt-Datei mit dem vorhandenen Songtext in /LRC-Agent ab.");
+  const lyricsItem=lyricsName?files.find(x=>x.name===lyricsName):files.find(x=>x.name.toLowerCase()===`${base.toLowerCase()}.txt`)||files.find(x=>x.name.toLowerCase()===`${cleanBase.toLowerCase()}.txt`)||files.filter(x=>textExt.test(x.name)).sort((a,b)=>Date.parse(b.modified||"")-Date.parse(a.modified||""))[0];
+  if(!lyricsItem)throw new Error("Keine Lyrics-Datei gefunden. Lege eine .txt-Datei mit dem vorhandenen Songtext in /LRC-Agent/in ab.");
 
-  const [audioBuf,lyricsBuf]=await Promise.all([download(c,audioItem.name),download(c,lyricsItem.name)]); const lyrics=lyricsBuf.toString("utf8").replace(/^\uFEFF/,"").trim();
+  const [audioBuf,lyricsBuf]=await Promise.all([download(c,`in/${audioItem.name}`),download(c,`in/${lyricsItem.name}`)]);
+  const lyrics=lyricsBuf.toString("utf8").replace(/^\uFEFF/,"").trim();
   if(!lyrics)throw new Error("Die Lyrics-Datei ist leer.");
   const key=String(process.env.OPENAI_API_KEY||""); if(!key)throw new Error("OPENAI_API_KEY fehlt."); const openai=new OpenAI({apiKey:key});
   const tr=await transcribe(openai,audioItem.name,audioBuf); const heard=tr.words; if(!heard.length)throw new Error("Keine Wort-Zeitmarken erhalten.");
@@ -150,9 +163,21 @@ async function processFiles(audioName?:string, lyricsName?:string) {
   const lineInfo=lines.map((line,lineIndex)=>{const idxs=target.map((x,i)=>x.lineIndex===lineIndex?i:-1).filter(i=>i>=0);const ms=idxs.map(i=>({i,m:targetToMatch.get(i)})).filter(x=>x.m) as Array<{i:number;m:{heardIndex:number;score:number}}>; if(ms.length){const first=ms[0].m,last=ms[ms.length-1].m;return{line,start:heard[first.heardIndex].start,end:heard[last.heardIndex].end,score:ms.reduce((a,x)=>a+x.m.score,0)/ms.length};} return{line,start:NaN,end:NaN,score:0};});
   for(let k=0;k<lineInfo.length;k++){if(Number.isFinite(lineInfo[k].start))continue;let p=k-1,nx=k+1;while(p>=0&&!Number.isFinite(lineInfo[p].start))p--;while(nx<lineInfo.length&&!Number.isFinite(lineInfo[nx].start))nx++;if(p>=0&&nx<lineInfo.length){const span=nx-p,frac=(k-p)/span;lineInfo[k].start=lineInfo[p].start+(lineInfo[nx].start-lineInfo[p].start)*frac;lineInfo[k].end=lineInfo[k].start+1.2;}else if(p>=0){lineInfo[k].start=lineInfo[p].end+.25;lineInfo[k].end=lineInfo[k].start+1.2;}else if(nx<lineInfo.length){lineInfo[k].start=Math.max(0,lineInfo[nx].start-(nx-k)*1.4);lineInfo[k].end=lineInfo[k].start+1.1;}else{lineInfo[k].start=k*1.5;lineInfo[k].end=lineInfo[k].start+1.2;}}
   for(let k=1;k<lineInfo.length;k++)if(lineInfo[k].start<=lineInfo[k-1].start)lineInfo[k].start=lineInfo[k-1].start+.12;
-  const title=/^Stlle\b/i.test(base)?base.replace(/^Stlle\b/i,"Stille"):base; const lrc=[`[ti:${title}]`,`[by:LRC-Agent]`,"",...lineInfo.map(x=>`${stampLRC(x.start)}${x.line}`)].join("\n"); const srt=lineInfo.map((x,i)=>{const next=lineInfo[i+1]?.start,end=Number.isFinite(next)?Math.max(x.start+.45,next-.06):Math.max(x.start+1.5,x.end);return `${i+1}\n${stampSRT(x.start)} --> ${stampSRT(end)}\n${x.line}`;}).join("\n\n");
-  const outBase=title; await Promise.all([uploadText(c,`${outBase}.lrc`,lrc),uploadText(c,`${outBase}.srt`,srt),uploadText(c,`${outBase}.transcript.txt`,tr.text)]); const lowConfidenceLines=lineInfo.filter(x=>x.score<.58).map(x=>({line:x.line,score:x.score}));
-  return {ok:true,audio:audioItem.name,lyrics:lyricsItem.name,title,lrcFile:`${outBase}.lrc`,srtFile:`${outBase}.srt`,transcriptFile:`${outBase}.transcript.txt`,chunks:tr.chunks,lowConfidenceLines};
+  const title=/^Stlle\b/i.test(base)?base.replace(/^Stlle\b/i,"Stille"):base;
+  const lrc=[`[ti:${title}]`,`[by:LRC-Agent]`,"",...lineInfo.map(x=>`${stampLRC(x.start)}${x.line}`)].join("\n");
+  const srt=lineInfo.map((x,i)=>{const next=lineInfo[i+1]?.start,end=Number.isFinite(next)?Math.max(x.start+.45,next-.06):Math.max(x.start+1.5,x.end);return `${i+1}\n${stampSRT(x.start)} --> ${stampSRT(end)}\n${x.line}`;}).join("\n\n");
+  const outBase=title;
+  await Promise.all([
+    uploadText(c,`out/${outBase}.lrc`,lrc),
+    uploadText(c,`out/${outBase}.srt`,srt),
+    uploadText(c,`out/${outBase}.transcript.txt`,tr.text)
+  ]);
+  await Promise.all([
+    moveFile(c,`in/${audioItem.name}`,`done/${audioItem.name}`),
+    moveFile(c,`in/${lyricsItem.name}`,`done/${lyricsItem.name}`)
+  ]);
+  const lowConfidenceLines=lineInfo.filter(x=>x.score<.58).map(x=>({line:x.line,score:x.score}));
+  return {ok:true,audio:audioItem.name,lyrics:lyricsItem.name,title,lrcFile:`out/${outBase}.lrc`,srtFile:`out/${outBase}.srt`,transcriptFile:`out/${outBase}.transcript.txt`,chunks:tr.chunks,lowConfidenceLines};
 }
 
 export async function GET(req:Request){try{const u=new URL(req.url);return NextResponse.json(await processFiles(u.searchParams.get("audio")||undefined,u.searchParams.get("lyrics")||undefined));}catch(e:any){return NextResponse.json({ok:false,error:e?.message||"Unbekannter Fehler."},{status:500});}}
