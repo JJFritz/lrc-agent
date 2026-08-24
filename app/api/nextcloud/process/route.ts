@@ -63,7 +63,7 @@ async function uploadText(c: NcConfig, relativePath: string, text: string) {
   const r = await fetch(davUrl(c, relativePath), {
     method: "PUT",
     headers: { Authorization: authHeader(c), "Content-Type": "text/plain; charset=utf-8" },
-    body: text,
+    body: Buffer.from(text, "utf8"),
   });
   if (!r.ok && r.status !== 201 && r.status !== 204) {
     throw new Error(`Ergebnis ${relativePath} konnte nicht in Nextcloud gespeichert werden (${r.status}).`);
@@ -77,6 +77,21 @@ async function moveFile(c: NcConfig, from: string, to: string) {
   });
   if (!r.ok && r.status !== 201 && r.status !== 204) {
     throw new Error(`Datei ${from} konnte nicht nach ${to} verschoben werden (${r.status}).`);
+  }
+}
+
+function decodeLyricsBuffer(buf: Buffer) {
+  const bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
+    return new TextDecoder("utf-16le").decode(bytes).replace(/^\uFEFF/, "").trim();
+  }
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
+    return new TextDecoder("utf-16be").decode(bytes).replace(/^\uFEFF/, "").trim();
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/^\uFEFF/, "").trim();
+  } catch {
+    return new TextDecoder("windows-1252").decode(bytes).replace(/^\uFEFF/, "").trim();
   }
 }
 
@@ -144,18 +159,19 @@ async function transcribe(openai:OpenAI, audioName:string, audio:Buffer) {
   return {words,text:texts.join(" ").trim(),chunks:parts.length};
 }
 
-async function processFiles(audioName?:string, lyricsName?:string) {
+async function processFiles(audioName?:string, lyricsName?:string, sourceFolder="in") {
+  if(sourceFolder!=="in" && sourceFolder!=="done") throw new Error("Ungültiger Quellordner.");
   const c=getConfig();
-  const files=(await listFolder(c,"in")).filter(x=>!x.isCollection);
+  const files=(await listFolder(c,sourceFolder)).filter(x=>!x.isCollection);
   const audioExt=/\.(wav|mp3|m4a|flac|ogg|webm)$/i; const textExt=/\.(txt|lyrics)$/i;
   const audioItem=audioName?files.find(x=>x.name===audioName):files.filter(x=>audioExt.test(x.name)).sort((a,b)=>Date.parse(b.modified||"")-Date.parse(a.modified||""))[0];
-  if(!audioItem)throw new Error("Im Nextcloud-Ordner /LRC-Agent/in wurde keine Audiodatei gefunden.");
+  if(!audioItem)throw new Error(`Im Nextcloud-Ordner /LRC-Agent/${sourceFolder} wurde keine Audiodatei gefunden.`);
   const base=audioItem.name.replace(/\.[^.]+$/,""), cleanBase=base.replace(/^Stlle\b/i,"Stille");
   const lyricsItem=lyricsName?files.find(x=>x.name===lyricsName):files.find(x=>x.name.toLowerCase()===`${base.toLowerCase()}.txt`)||files.find(x=>x.name.toLowerCase()===`${cleanBase.toLowerCase()}.txt`)||files.filter(x=>textExt.test(x.name)).sort((a,b)=>Date.parse(b.modified||"")-Date.parse(a.modified||""))[0];
-  if(!lyricsItem)throw new Error("Keine Lyrics-Datei gefunden. Lege eine .txt-Datei mit dem vorhandenen Songtext in /LRC-Agent/in ab.");
+  if(!lyricsItem)throw new Error(`Keine Lyrics-Datei in /LRC-Agent/${sourceFolder} gefunden.`);
 
-  const [audioBuf,lyricsBuf]=await Promise.all([download(c,`in/${audioItem.name}`),download(c,`in/${lyricsItem.name}`)]);
-  const lyrics=lyricsBuf.toString("utf8").replace(/^\uFEFF/,"").trim();
+  const [audioBuf,lyricsBuf]=await Promise.all([download(c,`${sourceFolder}/${audioItem.name}`),download(c,`${sourceFolder}/${lyricsItem.name}`)]);
+  const lyrics=decodeLyricsBuffer(lyricsBuf);
   if(!lyrics)throw new Error("Die Lyrics-Datei ist leer.");
   const key=String(process.env.OPENAI_API_KEY||""); if(!key)throw new Error("OPENAI_API_KEY fehlt."); const openai=new OpenAI({apiKey:key});
   const tr=await transcribe(openai,audioItem.name,audioBuf); const heard=tr.words; if(!heard.length)throw new Error("Keine Wort-Zeitmarken erhalten.");
@@ -172,13 +188,15 @@ async function processFiles(audioName?:string, lyricsName?:string) {
     uploadText(c,`out/${outBase}.srt`,srt),
     uploadText(c,`out/${outBase}.transcript.txt`,tr.text)
   ]);
-  await Promise.all([
-    moveFile(c,`in/${audioItem.name}`,`done/${audioItem.name}`),
-    moveFile(c,`in/${lyricsItem.name}`,`done/${lyricsItem.name}`)
-  ]);
+  if(sourceFolder==="in") {
+    await Promise.all([
+      moveFile(c,`in/${audioItem.name}`,`done/${audioItem.name}`),
+      moveFile(c,`in/${lyricsItem.name}`,`done/${lyricsItem.name}`)
+    ]);
+  }
   const lowConfidenceLines=lineInfo.filter(x=>x.score<.58).map(x=>({line:x.line,score:x.score}));
-  return {ok:true,audio:audioItem.name,lyrics:lyricsItem.name,title,lrcFile:`out/${outBase}.lrc`,srtFile:`out/${outBase}.srt`,transcriptFile:`out/${outBase}.transcript.txt`,chunks:tr.chunks,lowConfidenceLines};
+  return {ok:true,audio:audioItem.name,lyrics:lyricsItem.name,title,lrcFile:`out/${outBase}.lrc`,srtFile:`out/${outBase}.srt`,transcriptFile:`out/${outBase}.transcript.txt`,chunks:tr.chunks,sourceFolder,lowConfidenceLines};
 }
 
-export async function GET(req:Request){try{const u=new URL(req.url);return NextResponse.json(await processFiles(u.searchParams.get("audio")||undefined,u.searchParams.get("lyrics")||undefined));}catch(e:any){return NextResponse.json({ok:false,error:e?.message||"Unbekannter Fehler."},{status:500});}}
-export async function POST(req:Request){try{let body:any={};try{body=await req.json();}catch{}return NextResponse.json(await processFiles(body.audioName,body.lyricsName));}catch(e:any){return NextResponse.json({ok:false,error:e?.message||"Unbekannter Fehler."},{status:500});}}
+export async function GET(req:Request){try{const u=new URL(req.url);return NextResponse.json(await processFiles(u.searchParams.get("audio")||undefined,u.searchParams.get("lyrics")||undefined,u.searchParams.get("folder")||"in"));}catch(e:any){return NextResponse.json({ok:false,error:e?.message||"Unbekannter Fehler."},{status:500});}}
+export async function POST(req:Request){try{let body:any={};try{body=await req.json();}catch{}return NextResponse.json(await processFiles(body.audioName,body.lyricsName,body.folder||"in"));}catch(e:any){return NextResponse.json({ok:false,error:e?.message||"Unbekannter Fehler."},{status:500});}}
